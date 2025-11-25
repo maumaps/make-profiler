@@ -4,7 +4,7 @@ Helps managing a large data processing pipeline written in Makefile.
 
 ## Features
 
-- SVG build overview (example: https://github.com/gojuno/make-profiler/blob/master/make.svg);
+- SVG build overview;
 
 ![build graph example](make.png)
 
@@ -29,7 +29,7 @@ Helps managing a large data processing pipeline written in Makefile.
 ## Example usage
 
     sudo apt install python3-pip graphviz gawk
-    sudo pip3 install https://github.com/konturio/make-profiler/archive/master.zip
+    sudo pip3 install https://github.com/maumaps/make-profiler/archive/master.zip --break-system-packages
 
     cd your_project
     profile_make -h                 # have a look at help
@@ -47,7 +47,7 @@ Helps managing a large data processing pipeline written in Makefile.
     profile_make -a 2022-05-01      # generate overview graph with full target time only after the specified date
 
     profile_make --analyze target_name
-                               # print timing statistics for target
+                                    # print timing statistics for target
 
     profile_make_init_viewer -o="~/public_html"   # Create files for web-based dashboard in the public_html folder.
 
