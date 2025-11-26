@@ -3,7 +3,7 @@ import collections
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from make_profiler.parser import parse
@@ -38,6 +38,8 @@ class TargetData:
     line_number: int | None = None
     line_text: str | None = None
     grouped: bool = False
+    deps: list[str] = field(default_factory=list)
+    order_only_deps: list[str] = field(default_factory=list)
 
 
 def _create_error(
@@ -110,6 +112,7 @@ def parse_targets(
             continue
 
         names = data.get("all_targets", [data["target"]])
+        deps_list, order_only_list = data.get("deps", ([], []))
         for name in names:
             line_number, line_text = line_map.get(name, (None, None))
             target_data.append(
@@ -119,6 +122,8 @@ def parse_targets(
                     line_number=line_number,
                     line_text=line_text,
                     grouped=data.get("grouped", False),
+                    deps=list(deps_list),
+                    order_only_deps=list(order_only_list),
                 ),
             )
 
@@ -187,6 +192,7 @@ def validate_missing_rules(
     deps: set[str],
     deps_map: dict[str, set[str]],
     *,
+    root_dir: str,
     errors: list[LintError] | None = None,
 ) -> bool:
     """Report dependencies that do not have a rule or a file backing them."""
@@ -195,7 +201,8 @@ def validate_missing_rules(
     target_map = {t.name: t for t in targets}
     target_names = set(target_map)
     for dep in deps:
-        if dep not in target_names and not os.path.exists(dep):
+        candidate = _resolve_filesystem_path(dep, root_dir)
+        if dep not in target_names and not os.path.exists(candidate):
             for parent in sorted(deps_map.get(dep, [])):
                 msg = f"No rule to make target '{dep}', needed by '{parent}'"
                 print(msg, file=sys.stderr)
@@ -301,6 +308,59 @@ def validate_multiple_targets_colon(
     return is_valid
 
 
+def _resolve_filesystem_path(path: str, root_dir: str) -> str:
+    """Return an absolute path for dependency lookups."""
+
+    if not root_dir or os.path.isabs(path):
+        return path
+    return os.path.join(root_dir, path)
+
+
+def _looks_like_directory(path: str, root_dir: str) -> bool:
+    """Best-effort detection whether a dependency refers to an actual directory."""
+
+    if not path or any(char in path for char in ("$", "*", "?", "[", "]", "%", "(", ")")):
+        return False
+
+    candidate = _resolve_filesystem_path(path, root_dir)
+    return os.path.isdir(candidate)
+
+
+def validate_directory_order_only_dependencies(
+    targets: list[TargetData],
+    *,
+    root_dir: str,
+    errors: list[LintError] | None = None,
+) -> bool:
+    """Ensure directories are only listed as order-only prerequisites."""
+
+    is_valid = True
+    for t in targets:
+        for dep in t.deps:
+            if dep in t.order_only_deps:
+                # Already explicitly marked as order-only, nothing to report.
+                continue
+            if not _looks_like_directory(dep, root_dir):
+                continue
+            msg = (
+                f"Directory dependency '{dep}' on target '{t.name}' must be "
+                "order-only (list it after '|')."
+            )
+            print(msg, file=sys.stderr)
+            if errors is not None:
+                errors.append(
+                    _create_error(
+                        "directory dependency not order-only",
+                        msg,
+                        line_number=t.line_number,
+                        line_text=t.line_text,
+                    ),
+                )
+            is_valid = False
+
+    return is_valid
+
+
 TARGET_VALIDATORS: list[Callable[..., bool]] = [
     validate_orphan_targets,
     validate_target_comments,
@@ -317,9 +377,14 @@ def validate(
     deps: set[str],
     deps_map: dict[str, set[str]],
     *,
+    root_dir: str | None = None,
     errors: list[LintError] | None = None,
 ) -> bool:
     """Run all validators and collect error messages."""
+
+    if root_dir is None:
+        root_dir = os.getcwd()
+
     is_valid = True
 
     for validator in TEXT_VALIDATORS:
@@ -330,8 +395,25 @@ def validate(
             is_valid = validator(targets, errors=errors) and is_valid
         elif validator is validate_orphan_targets:
             is_valid = validator(targets, deps, errors=errors) and is_valid
+        elif validator is validate_missing_rules:
+            is_valid = validator(
+                targets,
+                deps,
+                deps_map,
+                root_dir=root_dir,
+                errors=errors,
+            ) and is_valid
         else:
             is_valid = validator(targets, deps, deps_map, errors=errors) and is_valid
+
+    is_valid = (
+        validate_directory_order_only_dependencies(
+            targets,
+            root_dir=root_dir,
+            errors=errors,
+        )
+        and is_valid
+    )
 
     return is_valid
 
@@ -367,8 +449,16 @@ def main():
 
     targets, deps, deps_map = parse_targets(ast, makefile_lines)
 
+    root_dir = os.path.dirname(os.path.abspath(args.in_filename)) or "."
     errors: list[LintError] = []
-    if not validate(makefile_lines, targets, deps, deps_map, errors=errors):
+    if not validate(
+        makefile_lines,
+        targets,
+        deps,
+        deps_map,
+        root_dir=root_dir,
+        errors=errors,
+    ):
         summary = summarize_errors(errors)
         print(f"Makefile validation failed: {summary}", file=sys.stderr)
         return 1

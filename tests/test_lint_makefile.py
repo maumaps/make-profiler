@@ -2,12 +2,22 @@ import io
 from make_profiler import parser, lint_makefile
 
 
-def run_validation(mk: str) -> tuple[bool, list[lint_makefile.LintError]]:
+def run_validation(
+    mk: str,
+    root_dir: str | None = None,
+) -> tuple[bool, list[lint_makefile.LintError]]:
     lines = mk.splitlines()
     ast = parser.parse(io.StringIO(mk))
     targets, deps, dep_map = lint_makefile.parse_targets(ast, lines)
     errors: list[lint_makefile.LintError] = []
-    valid = lint_makefile.validate(lines, targets, deps, dep_map, errors=errors)
+    valid = lint_makefile.validate(
+        lines,
+        targets,
+        deps,
+        dep_map,
+        root_dir=root_dir,
+        errors=errors,
+    )
     return valid, errors
 
 
@@ -153,4 +163,33 @@ def test_multiple_targets_grouped_is_ok() -> None:
         "\t@echo dep\n"
     )
     valid, errors = run_validation(mk)
+    assert valid, errors
+
+
+def test_directory_dependency_requires_order_only(tmp_path) -> None:
+    workdir = tmp_path / "mk"
+    workdir.mkdir()
+    monitored_dir = workdir / "artifacts"
+    monitored_dir.mkdir()
+    mk = (
+        "build: artifacts ## [FINAL] build app\n"
+        "\t@echo hi\n"
+    )
+    valid, errors = run_validation(mk, root_dir=str(workdir))
+    assert not valid
+    assert any(
+        e.error_type == "directory dependency not order-only" for e in errors
+    ), errors
+
+
+def test_directory_dependency_order_only_is_ok(tmp_path) -> None:
+    workdir = tmp_path / "mk"
+    workdir.mkdir()
+    logs_dir = workdir / "logs"
+    logs_dir.mkdir()
+    mk = (
+        "sync: | logs ## [FINAL] sync logs\n"
+        "\t@echo hi\n"
+    )
+    valid, errors = run_validation(mk, root_dir=str(workdir))
     assert valid, errors

@@ -9,7 +9,10 @@ A `target` is the left part of a Makefile rule before the colon. Each target may
 `dependencies` are the direct prerequisites of a target listed after the colon. They are returned by `parser.get_dependencies_influences` as a mapping of target name to a pair of lists. The first list contains normal dependencies; the second list contains order-only dependencies.
 
 ## Order-only dependencies
-Order-only dependencies are written after `|` in a Makefile rule. They enforce build order but do not trigger a rebuild when their timestamps change. They are collected separately in the returned `order_only` set and displayed in a dedicated cluster in the generated graph.
+Order-only dependencies are written after `|` in a Makefile rule.
+They enforce build order but do not trigger a rebuild when their timestamps change.
+They are collected separately in the returned `order_only` set and displayed in a dedicated cluster in the generated graph.
+The linter reports a violation when a target lists an existing directory as a normal dependency, because directories should only establish ordering guarantees and belong after the `|`.
 
 ## Influences
 `influences` is a mapping from a dependency to all targets that directly depend on it. If `B` depends on `A`, then `A` influences `B`. This structure is used for traversing the dependency graph in the forward direction.
@@ -40,4 +43,3 @@ The profiler merges `foo` and `bar` into one node so the recipe appears only
 once in the call graph. When multiple targets are listed with a plain `:`, Make
 may run the recipe more than once in parallel; the linter reports this pattern
 and suggests using `&:` instead.
-
