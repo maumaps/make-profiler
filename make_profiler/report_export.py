@@ -70,7 +70,7 @@ def export_report(performance, docs, targets):
             if last_event_time == '':
                 last_event_time = None
 
-            log_path = rec.get("log", "")
+            log_path = rec.get("log") or ""
 
             status.append(
                 {"targetName": key,
