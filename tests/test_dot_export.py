@@ -1,5 +1,5 @@
 import io
-from make_profiler.dot_export import export_dot
+from make_profiler.dot_export import critical_path, export_dot
 from make_profiler import parser
 
 def build_sample():
@@ -43,6 +43,177 @@ def test_critical_path_handles_final_targets():
     export_dot(f, inf, deps, set(), {}, {'a': set()}, {'a': 'Doc'})
     data = f.getvalue()
     assert 'subgraph cluster_tools' in data
+
+
+def test_critical_path_handles_disconnected_components():
+    """Disconnected Makefile components retain their complete critical paths."""
+    ast = parser.parse(io.StringIO('all: input\ninput:\norphan:\n'))
+    dependencies, influences, _order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    critical, _ = critical_path(influences, dependencies, {'input', 'orphan'}, {})
+
+    assert critical == {'all', 'input', 'orphan'}, (
+        "Disconnected components must propagate late starts through their own "
+        f"valid reverse edges; got {critical!r} from {dependencies!r}."
+    )
+
+
+def test_repeated_target_rules_merge_dependencies_for_critical_path():
+    """Repeated GNU Make rules must preserve every dependency branch."""
+    ast = parser.parse(io.StringIO('all: a\nall: b\na:\nb:\n'))
+    dependencies, influences, _order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    critical, _ = critical_path(influences, dependencies, {'a', 'b'}, {})
+
+    assert dependencies['all'] == [['a', 'b'], []], (
+        "Repeated single-colon rules must combine normal prerequisites in the "
+        f"reverse graph; got {dependencies['all']!r}."
+    )
+    assert critical == {'a', 'all', 'b'}, (
+        "Both equally long branches of repeated target 'all' must stay "
+        f"critical; got {critical!r} from {dependencies!r}."
+    )
+
+
+def test_repeated_target_rules_preserve_dependency_order_and_deduplication():
+    """Repeated GNU Make rules must keep first-seen prerequisite order."""
+    ast = parser.parse(
+        io.StringIO(
+            'all: c a | stamp\n'
+            'all: b a | stamp cache\n'
+            'a:\n'
+            'b:\n'
+            'c:\n'
+            'stamp:\n'
+            'cache:\n'
+        )
+    )
+    dependencies, influences, order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['all'] == [['a', 'c', 'b'], ['stamp', 'cache']], (
+        "Repeated target rules must deduplicate prerequisites while preserving "
+        f"their first-seen parser order; got {dependencies['all']!r}."
+    )
+    assert influences['a'] == {'all'}, (
+        "Normal prerequisite 'a' should influence 'all' exactly once after "
+        f"deduplication; got {influences['a']!r}."
+    )
+    assert influences['b'] == {'all'}, (
+        "Normal prerequisite 'b' should remain connected to 'all'; got "
+        f"{influences['b']!r}."
+    )
+    assert influences['c'] == {'all'}, (
+        "Normal prerequisite 'c' should remain connected to 'all'; got "
+        f"{influences['c']!r}."
+    )
+    assert 'all' not in influences['stamp'], (
+        "Order-only prerequisite 'stamp' must not become a normal reverse "
+        f"edge; got {influences['stamp']!r}."
+    )
+    assert order_only == {'stamp', 'cache'}, (
+        "Order-only prerequisites must still be tracked separately; got "
+        f"{order_only!r}."
+    )
+
+
+def test_pattern_rule_alternatives_are_not_merged():
+    """Pattern rules keep the base overwrite representation."""
+    ast = parser.parse(io.StringIO('%.o: %.c\n%.o: %.s\n'))
+    dependencies, influences, _order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['%.o'] == [['%.s'], []], (
+        "Pattern prerequisites must not be accumulated by the repeated-rule "
+        f"merge; got {dependencies['%.o']!r}."
+    )
+    assert influences['%.c'] == {'%.o'}
+    assert influences['%.s'] == {'%.o'}
+
+
+def test_pattern_order_only_prerequisite_is_registered_for_export():
+    """Pattern order-only nodes are present even when only the later rule has one."""
+    ast = parser.parse(
+        io.StringIO('%.o:\n%.o: | stamp\nall: %.o | stamp\nstamp:\n')
+    )
+    dependencies, influences, order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['%.o'] == [[], ['stamp']], (
+        "The current pattern rule must retain its order-only prerequisite; "
+        f"got {dependencies['%.o']!r}."
+    )
+    assert 'stamp' in influences and influences['stamp'] == set(), (
+        "Pattern order-only prerequisites must be registered as graph nodes; "
+        f"got {influences!r}."
+    )
+    assert order_only == {'stamp'}, (
+        "Pattern order-only prerequisites must remain globally classified; "
+        f"got {order_only!r}."
+    )
+
+    f = io.StringIO()
+    export_dot(f, influences, dependencies, order_only, {}, _indirect, {})
+
+
+def test_normal_prerequisite_dominates_order_only_on_repeated_rules():
+    """GNU Make treats an overlapping normal prerequisite as normal."""
+    ast = parser.parse(io.StringIO('all: input | stamp\nall: stamp\ninput:\nstamp:\n'))
+    dependencies, influences, order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['all'] == [['input', 'stamp'], []], (
+        "Normal prerequisites must absorb an overlapping order-only entry; "
+        f"got {dependencies['all']!r}."
+    )
+    assert order_only == set(), (
+        "A prerequisite promoted to normal must not remain order-only; got "
+        f"{order_only!r}."
+    )
+    assert influences['stamp'] == {'all'}, (
+        "The promoted prerequisite must retain its normal reverse edge; got "
+        f"{influences['stamp']!r}."
+    )
+
+
+def test_order_only_promotions_preserve_remaining_first_seen_order():
+    """Promotion must filter order-only prerequisites without reordering survivors."""
+    ast = parser.parse(
+        io.StringIO(
+            'all: | alpha beta gamma\n'
+            'all: beta zeta | delta\n'
+            'alpha:\n'
+            'beta:\n'
+            'gamma:\n'
+            'zeta:\n'
+            'delta:\n'
+        )
+    )
+    dependencies, influences, order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['all'] == [['beta', 'zeta'], ['alpha', 'gamma', 'delta']], (
+        "Promoted 'beta' must move to normal prerequisites while remaining "
+        "order-only prerequisites retain their first-seen order; got "
+        f"{dependencies['all']!r}."
+    )
+    assert influences['beta'] == {'all'}, (
+        "Promoted 'beta' must provide one normal reverse edge; got "
+        f"{influences['beta']!r}."
+    )
+    assert order_only == {'alpha', 'gamma', 'delta'}, (
+        "Only unpromoted prerequisites may remain globally order-only; got "
+        f"{order_only!r}."
+    )
+
+
+def test_critical_path_keeps_shorter_branch_noncritical():
+    """A complete reverse graph must not make genuinely shorter paths critical."""
+    ast = parser.parse(io.StringIO('all: slow fast\nslow:\nfast:\n'))
+    dependencies, influences, _order_only, _indirect = parser.get_dependencies_influences(ast)
+    timing = {'slow': {'timing_sec': 5}, 'fast': {'timing_sec': 1}}
+
+    critical, _ = critical_path(influences, dependencies, {'slow', 'fast'}, timing)
+
+    assert critical == {'all', 'slow'}, (
+        "Only the longest branch should be critical after reverse-edge "
+        f"propagation; got {critical!r} with timing {timing!r}."
+    )
 
 
 def test_example_makefile_from_readme():

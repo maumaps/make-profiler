@@ -193,8 +193,10 @@ def parse(fd: TextIO, is_check_loop: bool = True, loop_check_depth: int = 20) ->
 
 def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
     dependencies = {}
+    dependency_membership = {}
     influences = collections.defaultdict(set)
     order_only = set()
+    normal_dependencies = set()
     indirect_influences = collections.defaultdict(set)
 
     alias_map = {}
@@ -220,7 +222,39 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
         if target in ('.PHONY',):
             continue
 
-        dependencies[target] = [deps, order_deps]
+        # Pattern rules are alternatives, not repeated explicit rules.  Keep
+        # the base overwrite representation instead of applying explicit-rule
+        # prerequisite accumulation to them.
+        is_pattern_rule = any('%' in name for name in item.get('all_targets', []))
+        if is_pattern_rule:
+            dependencies[target] = [deps, order_deps]
+            influences[target]
+            for dep in deps:
+                influences[dep].add(target)
+            for dep in order_deps:
+                influences[dep]
+            order_only.update(order_deps)
+            continue
+
+        # GNU Make combines prerequisites from repeated single-colon rules.
+        # Keep the reverse graph aligned with the forward influences below so
+        # critical-path traversal can return through every incoming edge.
+        existing_deps, existing_order_deps = dependencies.setdefault(target, [[], []])
+        if target not in dependency_membership:
+            dependency_membership[target] = (set(existing_deps), set(existing_order_deps))
+        known_dep_names, known_order_dep_names = dependency_membership[target]
+        for dep in deps:
+            normal_dependencies.add(dep)
+            if dep in known_order_dep_names:
+                known_order_dep_names.remove(dep)
+            if dep not in known_dep_names:
+                existing_deps.append(dep)
+                known_dep_names.add(dep)
+        for dep in order_deps:
+            if dep in known_dep_names or dep in known_order_dep_names:
+                continue
+            existing_order_deps.append(dep)
+            known_order_dep_names.add(dep)
 
         # influences
         influences[target]
@@ -229,6 +263,19 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
         for k in order_deps:
             influences[k]
         order_only.update(order_deps)
+
+    # A normal prerequisite wins if it was also seen as order-only.
+    order_only.difference_update(normal_dependencies)
+
+    # Promotions above only update membership sets: removing an item from the
+    # ordered list for every promotion would repeatedly scan that list.  Filter
+    # each target once instead, retaining the first-seen order of surviving
+    # order-only prerequisites.
+    for target, (_known_deps, known_order_deps) in dependency_membership.items():
+        existing_order_deps = dependencies[target][1]
+        dependencies[target][1] = [
+            dep for dep in existing_order_deps if dep in known_order_deps
+        ]
 
     # Cache previously calculated descendants to avoid quadratic behaviour on
     # large graphs. ``descendants(target)`` returns a set of all nodes reachable
@@ -250,4 +297,3 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
         )
 
     return dependencies, influences, order_only, indirect_influences
-    
