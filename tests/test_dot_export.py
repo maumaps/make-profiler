@@ -125,8 +125,14 @@ def test_pattern_rule_alternatives_are_not_merged():
         "Pattern prerequisites must not be accumulated by the repeated-rule "
         f"merge; got {dependencies['%.o']!r}."
     )
-    assert influences['%.c'] == {'%.o'}
-    assert influences['%.s'] == {'%.o'}
+    assert influences['%.c'] == {'%.o'}, (
+        "The earlier pattern alternative must retain its reverse edge even "
+        f"though the forward representation is overwritten; got {influences!r}."
+    )
+    assert influences['%.s'] == {'%.o'}, (
+        "The current pattern alternative must retain its reverse edge; got "
+        f"{influences!r}."
+    )
 
 
 def test_pattern_order_only_prerequisite_is_registered_for_export():
@@ -151,6 +157,30 @@ def test_pattern_order_only_prerequisite_is_registered_for_export():
 
     f = io.StringIO()
     export_dot(f, influences, dependencies, order_only, {}, _indirect, {})
+
+
+def test_normal_pattern_prerequisite_dominates_explicit_order_only_export():
+    """A normal pattern prerequisite must never be globally order-only."""
+    ast = parser.parse(io.StringIO('%.o: shared\nall: %.o | shared\nshared:\n'))
+    dependencies, influences, order_only, indirect = parser.get_dependencies_influences(ast)
+
+    assert order_only == set(), (
+        "A normal pattern prerequisite must promote the shared prerequisite "
+        f"globally; got order_only={order_only!r} for {dependencies!r}."
+    )
+
+    f = io.StringIO()
+    export_dot(f, influences, dependencies, order_only, {}, indirect, {})
+    data = f.getvalue()
+
+    assert 'subgraph cluster_order_only' not in data, (
+        "export_dot must not emit an order-only cluster once 'shared' is "
+        f"promoted by the pattern rule; got {data!r}."
+    )
+    assert 'shared [label=shared' in data, (
+        "export_dot must retain the promoted prerequisite as a visible node; "
+        f"got {data!r}."
+    )
 
 
 def test_normal_prerequisite_dominates_order_only_on_repeated_rules():

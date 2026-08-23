@@ -192,6 +192,18 @@ def parse(fd: TextIO, is_check_loop: bool = True, loop_check_depth: int = 20) ->
 
 
 def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
+    """Build the dependency graph consumed by :func:`export_dot`.
+
+    Repeated explicit single-colon rules merge and deduplicate their
+    prerequisites in first-seen order.  A prerequisite seen normally is
+    normal everywhere, even if another rule lists it as order-only.  Pattern
+    rules remain alternatives, so their latest definition overwrites the
+    stored prerequisite lists rather than merging them.
+
+    Returns ``(dependencies, influences, order_only, indirect_influences)``.
+    ``order_only`` contains only prerequisites that were never normal;
+    ``export_dot`` uses it to hide otherwise-unconnected order-only nodes.
+    """
     dependencies = {}
     dependency_membership = {}
     influences = collections.defaultdict(set)
@@ -227,6 +239,7 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
         # prerequisite accumulation to them.
         is_pattern_rule = any('%' in name for name in item.get('all_targets', []))
         if is_pattern_rule:
+            normal_dependencies.update(deps)
             dependencies[target] = [deps, order_deps]
             influences[target]
             for dep in deps:
