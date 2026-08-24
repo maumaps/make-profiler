@@ -90,9 +90,9 @@ def test_repeated_target_rules_preserve_dependency_order_and_deduplication():
     )
     dependencies, influences, order_only, _indirect = parser.get_dependencies_influences(ast)
 
-    assert dependencies['all'] == [['a', 'c', 'b'], ['stamp', 'cache']], (
+    assert dependencies['all'] == [['c', 'a', 'b'], ['stamp', 'cache']], (
         "Repeated target rules must deduplicate prerequisites while preserving "
-        f"their first-seen parser order; got {dependencies['all']!r}."
+        f"their first-seen source order; got {dependencies['all']!r}."
     )
     assert influences['a'] == {'all'}, (
         "Normal prerequisite 'a' should influence 'all' exactly once after "
@@ -116,29 +116,54 @@ def test_repeated_target_rules_preserve_dependency_order_and_deduplication():
     )
 
 
-def test_pattern_rule_alternatives_are_not_merged():
-    """Pattern rules keep the base overwrite representation."""
+def test_repeated_target_rules_preserve_source_order():
+    """Repeated rules retain GNU Make's prerequisite encounter order."""
+    ast = parser.parse(io.StringIO('all: z a\nall: y\nz:\na:\ny:\n'))
+    dependencies, _influences, _order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['all'] == [['z', 'a', 'y'], []], (
+        "Repeated target rules must retain source prerequisite order, matching "
+        f"GNU Make's z, a, y processing order; got {dependencies['all']!r}."
+    )
+
+
+def test_pattern_rule_alternatives_keep_graph_directions_consistent():
+    """A stored pattern alternative must have matching forward and reverse edges."""
     ast = parser.parse(io.StringIO('%.o: %.c\n%.o: %.s\n'))
-    dependencies, influences, _order_only, _indirect = parser.get_dependencies_influences(ast)
+    dependencies, influences, order_only, indirect = parser.get_dependencies_influences(ast)
 
     assert dependencies['%.o'] == [['%.s'], []], (
         "Pattern prerequisites must not be accumulated by the repeated-rule "
         f"merge; got {dependencies['%.o']!r}."
     )
-    assert influences['%.c'] == {'%.o'}, (
-        "The earlier pattern alternative must retain its reverse edge even "
-        f"though the forward representation is overwritten; got {influences!r}."
-    )
     assert influences['%.s'] == {'%.o'}, (
-        "The current pattern alternative must retain its reverse edge; got "
+        "The stored pattern alternative must retain its reverse edge; got "
         f"{influences!r}."
+    )
+    assert '%.c' not in influences, (
+        "A superseded pattern alternative must not leave a reverse edge that "
+        f"is absent from dependencies; got {influences!r}."
+    )
+
+    f = io.StringIO()
+    export_dot(f, influences, dependencies, order_only, {}, indirect, {})
+    data = f.getvalue()
+
+    assert '"%.s" -> "%.o"' in data and '"%.c" -> "%.o"' not in data, (
+        "DOT export must render only the stored alternative instead of a "
+        f"conjunctive pattern graph; got {data!r}."
     )
 
 
 def test_pattern_order_only_prerequisite_is_registered_for_export():
-    """Pattern order-only nodes are present even when only the later rule has one."""
+    """Only the stored pattern alternative contributes order-only nodes."""
     ast = parser.parse(
-        io.StringIO('%.o:\n%.o: | stamp\nall: %.o | stamp\nstamp:\n')
+        io.StringIO(
+            '%.o: | obsolete\n'
+            '%.o: | stamp\n'
+            'all: %.o | stamp\n'
+            'stamp:\n'
+        )
     )
     dependencies, influences, order_only, _indirect = parser.get_dependencies_influences(ast)
 
@@ -151,12 +176,137 @@ def test_pattern_order_only_prerequisite_is_registered_for_export():
         f"got {influences!r}."
     )
     assert order_only == {'stamp'}, (
-        "Pattern order-only prerequisites must remain globally classified; "
-        f"got {order_only!r}."
+        "Only the current pattern order-only prerequisite must remain "
+        f"globally classified; got {order_only!r} from {dependencies!r}."
+    )
+    assert 'obsolete' not in influences, (
+        "A superseded pattern order-only prerequisite must not remain in the "
+        f"graph; got influences={influences!r}."
     )
 
     f = io.StringIO()
     export_dot(f, influences, dependencies, order_only, {}, _indirect, {})
+
+
+def test_pattern_normal_prerequisite_replaced_by_order_only_has_no_dot_edge():
+    """A pattern prerequisite changing category must lose its normal edge."""
+    ast = parser.parse(
+        io.StringIO('%.o: shared\n%.o: | shared\nall: %.o\nshared:\n')
+    )
+    dependencies, influences, order_only, indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['%.o'] == [[], ['shared']], (
+        "The stored pattern alternative must retain shared only as order-only; "
+        f"got {dependencies['%.o']!r}."
+    )
+    assert influences['shared'] == set(), (
+        "Replacing a normal pattern prerequisite with order-only must remove "
+        f"its reverse edge; got {influences!r}."
+    )
+    assert order_only == {'shared'}, (
+        "The replacement prerequisite must be globally order-only; got "
+        f"{order_only!r} from {dependencies!r}."
+    )
+
+    f = io.StringIO()
+    export_dot(f, influences, dependencies, order_only, {}, indirect, {})
+    data = f.getvalue()
+
+    assert 'shared -> "%.o"' not in data, (
+        "DOT must not render a normal edge for an order-only pattern "
+        f"prerequisite; got {data!r}."
+    )
+
+
+def test_pattern_normal_prerequisite_wins_over_same_rule_order_only_entry():
+    """A prerequisite cannot be both normal and order-only for one pattern."""
+    ast = parser.parse(io.StringIO('%.o: shared | shared\nall: %.o\nshared:\n'))
+    dependencies, influences, order_only, _indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['%.o'] == [['shared'], []], (
+        "A normal pattern prerequisite must remove its duplicate order-only "
+        f"entry; got dependencies={dependencies!r}."
+    )
+    assert influences['shared'] == {'%.o'}, (
+        "The shared prerequisite must retain exactly its normal reverse edge; "
+        f"got influences={influences!r}."
+    )
+    assert order_only == set(), (
+        "A normal pattern prerequisite cannot remain globally order-only; got "
+        f"order_only={order_only!r} from dependencies={dependencies!r}."
+    )
+
+
+def test_pattern_alternative_cleanup_keeps_cross_pattern_order_only_node():
+    """Replacing one pattern alternative must not erase another pattern's node."""
+    ast = parser.parse(
+        io.StringIO(
+            '%.a: | shared\n'
+            '%.b: shared\n'
+            '%.b: other\n'
+            'all: %.a %.b\n'
+            'other:\n'
+        )
+    )
+    dependencies, influences, order_only, indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['%.a'] == [[], ['shared']], (
+        "The unrelated pattern's order-only prerequisite must survive replacing "
+        f"%.b's alternative; got dependencies={dependencies!r}."
+    )
+    assert influences['shared'] == set(), (
+        "A live order-only prerequisite needs an empty graph node even after "
+        f"another pattern drops its normal edge; got influences={influences!r}."
+    )
+    assert order_only == {'shared'}, (
+        "Only the still-live cross-pattern prerequisite should be classified "
+        f"order-only; got order_only={order_only!r}, dependencies={dependencies!r}."
+    )
+
+    f = io.StringIO()
+    export_dot(f, influences, dependencies, order_only, {}, indirect, {})
+    data = f.getvalue()
+
+    assert 'shared -> "%.a"' not in data and 'shared -> "%.b"' not in data, (
+        "A prerequisite that is live only as order-only must not retain a normal "
+        f"edge from the superseded pattern alternative; got DOT={data!r}."
+    )
+
+
+def test_pattern_alternative_cleanup_keeps_declared_target_node():
+    """Replacing an alternative must not remove a declared prerequisite node."""
+    ast = parser.parse(
+        io.StringIO(
+            'src:\n'
+            'foo: src\n'
+            '%.a: foo\n'
+            '%.a: bar\n'
+            'all: %.a\n'
+            'bar:\n'
+        )
+    )
+    dependencies, influences, order_only, indirect = parser.get_dependencies_influences(ast)
+
+    assert dependencies['%.a'] == [['bar'], []], (
+        "The latest pattern alternative must replace the old prerequisite; got "
+        f"dependencies={dependencies!r}."
+    )
+    assert influences['foo'] == set(), (
+        "A declared target must remain an empty node after its stale pattern "
+        f"edge is removed; got influences={influences!r}."
+    )
+
+    f = io.StringIO()
+    export_dot(f, influences, dependencies, order_only, {}, indirect, {})
+    data = f.getvalue()
+
+    assert 'foo -> "%.a"' not in data, (
+        "The superseded normal edge must not be exported; got DOT={data!r}."
+    )
+    assert 'foo [label=foo' in data, (
+        "The declared target must remain exportable after pattern replacement; "
+        f"got DOT={data!r}."
+    )
 
 
 def test_normal_pattern_prerequisite_dominates_explicit_order_only_export():
