@@ -10,30 +10,27 @@ import time
 from datetime import datetime
 
 from make_profiler.dot_export import export_dot, render_dot
-from make_profiler.parser import get_dependencies_influences, make_command, parse_makefile
+from make_profiler.make_args import (
+    has_makefile_argument,
+    make_command,
+    make_environment,
+    make_goals,
+    make_working_directory,
+    scan_make_options,
+)
+from make_profiler.parser import get_dependencies_influences, parse_makefile
 from make_profiler.preprocess import generate_makefile
 from make_profiler.timing import parse_timing_db, analyze_target
 from make_profiler.report_export import export_report
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('make_profiler')
-TRACE_TARGET = re.compile(r"^.*:\d+: update target '([^']+)'(?: due to:|$)")
+# GNU Make 4.4 reports every rebuilt target as ``update target 'x' due to: ...``;
+# 4.3 reports file-less targets (``.PHONY``, never created files) as
+# ``target 'x' does not exist``.  Both mark the start of a target's recipes.
+TRACE_TARGET = re.compile(r"^.*?:\d+: (?:update )?target '([^']+)'(?: due to:.*| does not exist)?$")
+LOG_TIMESTAMP = '%Y-%m-%d %H:%M:%S'
 
-
-def make_working_directory(make_args):
-    """Return GNU Make's effective working directory after its ``-C`` options."""
-    directory = os.getcwd()
-    args = iter(make_args)
-    for argument in args:
-        if argument == '--':
-            break
-        if argument in ('-C', '--directory'):
-            directory = os.path.abspath(os.path.join(directory, next(args)))
-        elif argument.startswith('-C') and len(argument) > 2:
-            directory = os.path.abspath(os.path.join(directory, argument[2:]))
-        elif argument.startswith('--directory='):
-            directory = os.path.abspath(os.path.join(directory, argument.split('=', 1)[1]))
-    return directory
 
 
 def database_filename(filename, make_args):
@@ -41,30 +38,6 @@ def database_filename(filename, make_args):
     if os.path.isabs(filename):
         return filename
     return os.path.join(make_working_directory(make_args), filename)
-
-
-def make_goals(make_args):
-    """Return ordinary GNU Make goals without mistaking option values for goals."""
-    goals = []
-    option_values = {'-C', '-f', '-I', '--directory', '--file', '--makefile', '--include-dir', '--eval'}
-    after_separator = False
-    skip_next = False
-    for argument in make_args:
-        if after_separator:
-            goals.append(argument)
-        elif skip_next:
-            skip_next = False
-        elif argument == '--':
-            after_separator = True
-        elif argument in option_values:
-            skip_next = True
-        elif argument.startswith(('--directory=', '--file=', '--makefile=', '--include-dir=', '--eval=')):
-            continue
-        elif argument.startswith('-') or '=' in argument:
-            continue
-        else:
-            goals.append(argument)
-    return goals
 
 
 def make_arguments(argv):
@@ -102,16 +75,6 @@ def make_arguments(argv):
     return result
 
 
-def has_makefile_argument(make_args):
-    """Return whether GNU Make receives an explicit Makefile selection."""
-    for argument in make_args:
-        if argument == '--':
-            break
-        if argument in ('-f', '--file', '--makefile') or argument.startswith('-f'):
-            return True
-    return False
-
-
 def with_default_makefile(make_args, filename):
     """Preserve profile_make's historical ``Makefile`` default for every Make pass."""
     if has_makefile_argument(make_args):
@@ -129,11 +92,29 @@ def profile_target(make_args, db_filename):
     ``--trace`` is emitted by the same Make process that evaluates and runs
     the target, so include expansion, makefile remakes and command-line
     options cannot diverge from the profiled build.
+
+    Per target this writes ``start``/``finish`` records to the timing database
+    and, like the former instrumented Makefile, ``logs/<run>/<target>/log.txt``
+    (timestamped output) plus ``failed.touch`` for targets that were running
+    when Make failed.  ``--trace`` only announces where a target's recipes
+    begin, so a target ends when the next one begins.  With ``-j`` several
+    targets run at once and that inference is impossible: each target is then
+    closed when Make exits and the timings are approximate.  Dry runs
+    (``-n``, ``-q``, ``-t``) execute no recipes and are never recorded.
     """
-    command = make_command(make_args, ['--trace'])
+    options = scan_make_options(make_args)
+    record_events = not options['dry_run']
+    parallel = bool(options['jobs'])
+    command = make_command(make_args, ['--trace'] if record_events else [])
     logger.info(' '.join(command))
+    if record_events and parallel:
+        logger.warning(
+            'Parallel build (-j): --trace does not report when a recipe ends, '
+            'so recorded target timings are approximate (upper bounds).')
     run_id = secrets.token_hex(10)
-    active_target = None
+    directory = make_working_directory(make_args)
+    active = {}  # target -> True while its recipes may still be running
+    current_log = None
     output = []
     resolved_database_filename = database_filename(db_filename, make_args)
 
@@ -141,26 +122,61 @@ def profile_target(make_args, db_filename):
         with open(resolved_database_filename, 'a') as database:
             database.write(f'{int(time.time())} {run_id} {event} {target_name}\n')
 
+    def target_directory(target_name):
+        # Same spelling parse_timing_db uses to find the log again.
+        return os.path.join(directory, 'logs/%s/%s' % (run_id, target_name))
+
+    def finish(target_name, failed=False):
+        if failed:
+            os.makedirs(target_directory(target_name), exist_ok=True)
+            open(os.path.join(target_directory(target_name), 'failed.touch'), 'a').close()
+        record('finish', target_name)
+        del active[target_name]
+
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
+        env=make_environment(keep_recipe_locale=True),
     )
     for line in process.stdout:
-        trace_target = TRACE_TARGET.match(line)
+        trace_target = TRACE_TARGET.match(line) if record_events else None
         if trace_target:
-            if active_target is not None:
-                record('finish', active_target)
-            active_target = trace_target.group(1)
-            record('start', active_target)
+            if not parallel:
+                for previous in list(active):
+                    finish(previous)
+            target_name = trace_target.group(1)
+            active[target_name] = True
+            record('start', target_name)
+            os.makedirs(target_directory(target_name), exist_ok=True)
+            if current_log is not None:
+                current_log.close()
+            current_log = open(os.path.join(target_directory(target_name), 'log.txt'), 'a')
+            latest = os.path.join(directory, 'logs', 'latest')
+            try:
+                os.makedirs(os.path.dirname(latest), exist_ok=True)
+                if os.path.islink(latest):
+                    os.remove(latest)
+                if not os.path.lexists(latest):
+                    os.symlink(run_id, latest)
+            except OSError as error:
+                logger.warning('Cannot update %s: %s', latest, error)
             continue
         output.append(line)
         print(line, end='')
+        if current_log is not None:
+            current_log.write(f'[{time.strftime(LOG_TIMESTAMP)}] {line}')
+            current_log.flush()
 
     returncode = process.wait()
-    if returncode == 0 and active_target is not None:
-        record('finish', active_target)
+    if current_log is not None:
+        current_log.close()
+    # Whatever was still running when Make exited ends now, successfully or
+    # not; on failure it is marked failed so the report does not show it as
+    # still running.
+    for target_name in list(active):
+        finish(target_name, failed=returncode != 0)
     if returncode != 0:
         raise subprocess.CalledProcessError(returncode, command, output=''.join(output))
 
@@ -210,21 +226,21 @@ def main(argv=sys.argv[1:]):
         '--disable_loop_detection',
         dest='disable_loop_detection',
         action='store_false',
-        help='Disable cycle detection for include instructions')
+        help='Deprecated no-op: GNU Make now resolves includes itself')
     parser.add_argument(
         '--include_depth',
         action='store',
         dest='include_depth',
         type=int,
         default=20,
-        help='Depth of the nesting includes')
+        help='Deprecated no-op: GNU Make now resolves includes itself')
 
     args, _ = parser.parse_known_args(argv)
     make_args = with_default_makefile(make_arguments(argv), args.in_filename)
     resolved_database_filename = database_filename(args.db_filename, make_args)
 
     if args.analyze:
-        stats = analyze_target(resolved_database_filename, args.analyze)
+        stats = analyze_target(resolved_database_filename, args.analyze, make_working_directory(make_args))
         print('started:', stats['started'])
         print('finished:', stats['finished'])
         if stats['finished']:
@@ -253,7 +269,7 @@ def main(argv=sys.argv[1:]):
             continue
         for name in data.get('all_targets', [data['target']]):
             docs[name] = data['docs']
-    performance = parse_timing_db(resolved_database_filename, args.after_date)
+    performance = parse_timing_db(resolved_database_filename, args.after_date, make_working_directory(make_args))
     deps, influences, order_only, indirect_influences = get_dependencies_influences(ast)
 
     dot_file = io.StringIO()
@@ -281,5 +297,17 @@ def main(argv=sys.argv[1:]):
     )
 
 
+def cli(argv=None):
+    """Console entry point: exit with GNU Make's own status when a build fails."""
+    try:
+        main(sys.argv[1:] if argv is None else argv)
+    except subprocess.CalledProcessError as error:
+        # A profiled build streamed Make's output already; the report passes
+        # carry Make's diagnostic in ``stderr``.
+        if error.stderr:
+            sys.stderr.write(error.stderr)
+        sys.exit(error.returncode)
+
+
 if __name__ == '__main__':
-    main()
+    cli()

@@ -9,6 +9,15 @@ from typing import Any, Dict, Generator, List, Tuple, TextIO
 
 from more_itertools import peekable
 
+from make_profiler.make_args import (  # noqa: F401  (re-exported for callers)
+    has_makefile_argument,
+    make_command,
+    make_environment,
+    make_include_directories,
+    make_working_directory,
+    makefile_arguments,
+)
+
 
 class Tokens(str, Enum):
     target = "target"
@@ -17,52 +26,6 @@ class Tokens(str, Enum):
 
 
 INCLUDE_DIRECTIVE = re.compile(r'^[ ]*(?:-?include|sinclude)\s+')
-
-
-def make_command(make_args, extra_args):
-    """Insert internal GNU Make options before its optional ``--`` separator."""
-    try:
-        separator = make_args.index('--')
-    except ValueError:
-        return ['make', *make_args, *extra_args]
-    return ['make', *make_args[:separator], *extra_args, *make_args[separator:]]
-
-
-def make_working_directory(make_args) -> str:
-    """Return GNU Make's effective working directory after its ``-C`` options."""
-    directory = os.getcwd()
-    arguments = iter(make_args)
-    for argument in arguments:
-        if argument == '--':
-            break
-        if argument in ('-C', '--directory'):
-            directory = os.path.abspath(os.path.join(directory, next(arguments)))
-        elif argument.startswith('-C') and len(argument) > 2:
-            directory = os.path.abspath(os.path.join(directory, argument[2:]))
-        elif argument.startswith('--directory='):
-            directory = os.path.abspath(os.path.join(directory, argument.split('=', 1)[1]))
-    return directory
-
-
-def make_include_directories(make_args, working_directory) -> List[str]:
-    """Return GNU Make's include search directories in command-line order."""
-    directories = []
-    arguments = iter(make_args)
-    for argument in arguments:
-        if argument == '--':
-            break
-        if argument in ('-I', '--include-dir'):
-            directory = next(arguments)
-        elif argument.startswith('-I') and len(argument) > 2:
-            directory = argument[2:]
-        elif argument.startswith('--include-dir='):
-            directory = argument.split('=', 1)[1]
-        else:
-            continue
-        directories.append(
-            directory if os.path.isabs(directory) else os.path.join(working_directory, directory)
-        )
-    return directories
 
 
 def documented_targets(makefile: str) -> Dict[str, str]:
@@ -84,20 +47,16 @@ def included_makefiles(output: str, working_directory: str) -> List[str]:
     prefix = 'MAKEFILE_LIST := '
     value = next((line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)), '')
     makefiles = []
-    while value:
-        boundaries = [index for index, character in enumerate(value) if character.isspace()]
-        boundaries.append(len(value))
-        candidates = []
-        for boundary in boundaries:
-            candidate = value[:boundary].replace('\\ ', ' ')
-            path = candidate if os.path.isabs(candidate) else os.path.join(working_directory, candidate)
-            if os.path.isfile(path):
-                candidates.append((boundary, path))
-        if not candidates:
-            break
-        boundary, path = candidates[-1]
-        makefiles.append(path)
-        value = value[boundary:].lstrip()
+    # GNU Make escapes a space inside a name as ``\ ``; any other whitespace
+    # separates entries.  Splitting once keeps this linear in the list length,
+    # with one filesystem probe per entry.
+    for entry in re.split(r'(?<!\\)\s+', value.strip()):
+        candidate = entry.replace('\\ ', ' ')
+        if not candidate:
+            continue
+        path = candidate if os.path.isabs(candidate) else os.path.join(working_directory, candidate)
+        if os.path.isfile(path):
+            makefiles.append(path)
     return makefiles
 
 
@@ -138,36 +97,21 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
     GNU Make, rather than this parser, evaluates conditionals, variables and
     includes. ``--question`` keeps the database probe from running targets.
     """
-    command = make_command(make_args, [
+    extra_args = [
         '--no-builtin-rules',
         '--no-builtin-variables',
         '--print-data-base',
         '--question',
-    ])
-    has_makefile_argument = False
-    for argument in make_args:
-        if argument == '--':
-            break
-        if argument in ('-f', '--file', '--makefile') or argument.startswith('-f'):
-            has_makefile_argument = True
-            break
-    if not has_makefile_argument:
-        command = make_command(
-            make_args,
-            [
-                '--no-builtin-rules',
-                '--no-builtin-variables',
-                '--print-data-base',
-                '--question',
-                '--file',
-                filename,
-            ],
-        )
+    ]
+    if not has_makefile_argument(make_args):
+        extra_args += ['--file', filename]
+    command = make_command(make_args, extra_args)
     result = subprocess.run(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         universal_newlines=True,
+        env=make_environment(),
     )
     if result.returncode not in (0, 1):
         raise subprocess.CalledProcessError(
@@ -193,7 +137,10 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
     in_files = False
     skip_target = False
     current_target = None
-    current_source = filename
+    # Rules without a recipe carry no source annotation; they come from the
+    # first Makefile Make was told to read (``-f``/``--file``/``--makefile``).
+    default_source = next(iter(makefile_arguments(make_args)), filename)
+    current_source = default_source
     source_docs = {}
     working_directory = make_working_directory(make_args)
     include_directories = make_include_directories(make_args, working_directory)
@@ -209,6 +156,7 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
         return source_docs[path]
 
     all_docs = {}
+    grouped_entries = {}
     for makefile in included_makefiles(result.stdout, working_directory):
         all_docs.update(docs_for(makefile))
 
@@ -224,7 +172,17 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
                 ),
                 '',
             )
-            ast.append((Tokens.target, current_target))
+            members = frozenset(current_target['all_targets'])
+            if current_target['grouped'] and members in grouped_entries:
+                # GNU Make prints a grouped rule once per member; the recipe
+                # is attached to only one of those records, so merge them.
+                entry = grouped_entries[members]
+                entry['body'] = entry['body'] or current_target['body']
+                entry['docs'] = entry['docs'] or current_target['docs']
+            else:
+                if current_target['grouped']:
+                    grouped_entries[members] = current_target
+                ast.append((Tokens.target, current_target))
             current_target = None
 
     for line in result.stdout.splitlines():
@@ -242,6 +200,14 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
             continue
         if line.startswith("#  recipe to execute (from '"):
             current_source = line[len("#  recipe to execute (from '"):].rsplit("', line ", 1)[0]
+            continue
+        if line.startswith('#  Also makes:'):
+            # Grouped targets (``a b &: c``) are printed as one ``a: c`` record
+            # per member, each followed by this comment listing the group.
+            if current_target is not None:
+                current_target['grouped'] = True
+                current_target['all_targets'] = sorted(line.split(':', 1)[1].split())
+                current_target['target'] = current_target['all_targets'][0]
             continue
         if line.startswith('#') or not line:
             continue
@@ -277,7 +243,7 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
             'docs': '',
             'body': [],
         }
-        current_source = filename
+        current_source = default_source
 
     return ast
 

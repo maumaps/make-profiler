@@ -1,5 +1,7 @@
 import os
+import shutil
 import subprocess
+import sys
 from io import StringIO
 from pathlib import Path
 
@@ -53,6 +55,7 @@ def test_missing_include_fails_loudly(tmp_path, monkeypatch):
     makefile = tmp_path / "Makefile"
     makefile.write_text("include missing/Makefile\n")
     disable_report_generation(monkeypatch)
+    monkeypatch.chdir(tmp_path)
 
     with pytest.raises(subprocess.CalledProcessError) as error:
         make_profiler_main.main(["-f", str(makefile), "target"])
@@ -120,6 +123,8 @@ def test_profile_make_preserves_goals_after_separator(
     expected_output,
     expected_records,
 ):
+    if shutil.which("dot") is None or shutil.which("unflatten") is None:
+        pytest.skip("Graphviz is required for the end-to-end profile_make run")
     makefile = tmp_path / "Makefile"
     makefile.write_text(
         "--dash-target:\n"
@@ -146,7 +151,7 @@ def test_profile_make_preserves_goals_after_separator(
         check=False,
     )
     result = subprocess.run(
-        ["profile_make", "--", *goals],
+        [sys.executable, "-m", "make_profiler", "-p", str(tmp_path / "out.svg"), "--", *goals],
         cwd=tmp_path,
         env=environment,
         stdout=subprocess.PIPE,
