@@ -1,17 +1,63 @@
 import collections
+import io
+import os
 import re
-import tempfile
+import subprocess
 
 from enum import Enum
-from typing import Any, Dict, Generator, List, Tuple, TextIO, Pattern
+from typing import Any, Dict, Generator, List, Tuple, TextIO
 
 from more_itertools import peekable
+
+from make_profiler.make_args import (  # noqa: F401  (re-exported for callers)
+    has_makefile_argument,
+    make_command,
+    make_environment,
+    make_include_directories,
+    make_working_directory,
+    makefile_arguments,
+)
 
 
 class Tokens(str, Enum):
     target = "target"
     command = "command"
     expression = "expression"
+
+
+INCLUDE_DIRECTIVE = re.compile(r'^[ ]*(?:-?include|sinclude)\s+')
+
+
+def documented_targets(makefile: str) -> Dict[str, str]:
+    """Read self-documenting target descriptions from one Makefile source."""
+    docs = {}
+    with open(makefile) as source:
+        for token, line in tokenizer(source):
+            if token != Tokens.target or '##' not in line:
+                continue
+            target_part, description = line.split('##', 1)
+            separator = '&:' if '&:' in target_part else ':'
+            for target in target_part.split(separator, 1)[0].strip().split():
+                docs[target] = description.strip()
+    return docs
+
+
+def included_makefiles(output: str, working_directory: str) -> List[str]:
+    """Recover existing source paths from GNU Make's space-separated database value."""
+    prefix = 'MAKEFILE_LIST := '
+    value = next((line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)), '')
+    makefiles = []
+    # GNU Make escapes a space inside a name as ``\ ``; any other whitespace
+    # separates entries.  Splitting once keeps this linear in the list length,
+    # with one filesystem probe per entry.
+    for entry in re.split(r'(?<!\\)\s+', value.strip()):
+        candidate = entry.replace('\\ ', ' ')
+        if not candidate:
+            continue
+        path = candidate if os.path.isabs(candidate) else os.path.join(working_directory, candidate)
+        if os.path.isfile(path):
+            makefiles.append(path)
+    return makefiles
 
 
 def tokenizer(fd: List[str]) -> Generator[Tuple[Tokens, str], None, None]:
@@ -45,86 +91,186 @@ def tokenizer(fd: List[str]) -> Generator[Tuple[Tokens, str], None, None]:
             yield (Tokens.expression, line.strip(' ;\t'))
 
 
-def parse(fd: TextIO, is_check_loop: bool = True, loop_check_depth: int = 20) -> List[Tuple[Tokens, Dict[str, Any]]]:
+def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, Any]]]:
+    """Read GNU Make's final rule database for a named Makefile.
+
+    GNU Make, rather than this parser, evaluates conditionals, variables and
+    includes. ``--question`` keeps the database probe from running ordinary
+    targets, but GNU Make may still remake stale included makefiles before
+    printing the database (see docs/profiling-and-includes.md).  Parsing is
+    therefore not side-effect-free; with goals the traced build already remade
+    them, and ``--preprocess_only`` may remake them as well.
+    """
+    extra_args = [
+        '--no-builtin-rules',
+        '--no-builtin-variables',
+        '--print-data-base',
+        '--question',
+    ]
+    if not has_makefile_argument(make_args):
+        extra_args += ['--file', filename]
+    command = make_command(make_args, extra_args)
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        # Same Makefile-visible locale as the traced build (profile_target uses
+        # keep_recipe_locale=True): an include or conditional using $(LC_ALL)
+        # must see the same environment in both Make processes.
+        env=make_environment(keep_recipe_locale=True),
+    )
+    if result.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            command,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+
+    ast = []
+    source_variable = False
+    for line in result.stdout.splitlines():
+        if line.startswith('# makefile ') or line.startswith('# command line'):
+            source_variable = True
+            continue
+        if line.startswith('#'):
+            source_variable = False
+            continue
+        if source_variable and line:
+            ast.append((Tokens.expression, line))
+            source_variable = False
+
+    in_files = False
+    skip_target = False
+    current_target = None
+    # Rules without a recipe carry no source annotation; they come from the
+    # first Makefile Make was told to read (``-f``/``--file``/``--makefile``).
+    default_source = next(iter(makefile_arguments(make_args)), filename)
+    current_source = default_source
+    source_docs = {}
+    working_directory = make_working_directory(make_args)
+    include_directories = make_include_directories(make_args, working_directory)
+
+    def docs_for(source):
+        paths = [source] if os.path.isabs(source) else [
+            os.path.join(working_directory, source),
+            *(os.path.join(directory, source) for directory in include_directories),
+        ]
+        path = next((candidate for candidate in paths if os.path.exists(candidate)), paths[0])
+        if path not in source_docs:
+            source_docs[path] = documented_targets(path)
+        return source_docs[path]
+
+    all_docs = {}
+    grouped_entries = {}
+    for makefile in included_makefiles(result.stdout, working_directory):
+        all_docs.update(docs_for(makefile))
+
+    def flush_target():
+        nonlocal current_target
+        if current_target is not None:
+            docs = docs_for(current_source)
+            current_target['docs'] = next(
+                (
+                    docs.get(target, all_docs.get(target, ''))
+                    for target in current_target['all_targets']
+                    if target in docs or target in all_docs
+                ),
+                '',
+            )
+            members = frozenset(current_target['all_targets'])
+            if current_target['grouped'] and members in grouped_entries:
+                # GNU Make prints a grouped rule once per member; the recipe
+                # is attached to only one of those records, so merge them.
+                entry = grouped_entries[members]
+                entry['body'] = entry['body'] or current_target['body']
+                entry['docs'] = entry['docs'] or current_target['docs']
+            else:
+                if current_target['grouped']:
+                    grouped_entries[members] = current_target
+                ast.append((Tokens.target, current_target))
+            current_target = None
+
+    for line in result.stdout.splitlines():
+        if line == '# Files':
+            in_files = True
+            continue
+        if not in_files:
+            continue
+        if line.startswith('# files hash-table stats:'):
+            flush_target()
+            break
+        if line.startswith('# Not a target:'):
+            flush_target()
+            skip_target = True
+            continue
+        if line.startswith("#  recipe to execute (from '"):
+            current_source = line[len("#  recipe to execute (from '"):].rsplit("', line ", 1)[0]
+            continue
+        if line.startswith('#  Also makes:'):
+            # Grouped targets (``a b &: c``) are printed as one ``a: c`` record
+            # per member, each followed by this comment listing the group.
+            if current_target is not None:
+                current_target['grouped'] = True
+                current_target['all_targets'] = sorted(line.split(':', 1)[1].split())
+                current_target['target'] = current_target['all_targets'][0]
+            continue
+        if line.startswith('#') or not line:
+            continue
+        if line.startswith('\t'):
+            if current_target is not None:
+                current_target['body'].append((Tokens.command, line.strip(' ;\t')))
+            continue
+        if ':' not in line or '=' in line:
+            continue
+
+        flush_target()
+        if skip_target:
+            skip_target = False
+            continue
+
+        sep = '&:' if '&:' in line else ':'
+        target_part, rest = line.split(sep, 1)
+        targets = target_part.strip().split()
+        if not targets:
+            continue
+        rest = rest.strip()
+        if '|' in rest:
+            deps_part, order_part = rest.split('|', 1)
+            order_deps = sorted(order_part.strip().split()) if order_part.strip() else []
+        else:
+            deps_part = rest
+            order_deps = []
+        current_target = {
+            'target': targets[0],
+            'all_targets': targets,
+            'grouped': sep == '&:',
+            'deps': [sorted(deps_part.split()), order_deps],
+            'docs': '',
+            'body': [],
+        }
+        current_source = default_source
+
+    return ast
+
+
+def parse(
+    fd: TextIO,
+    is_check_loop: bool = True,
+    loop_check_depth: int = 20,
+    make_args=(),
+) -> List[Tuple[Tokens, Dict[str, Any]]]:
     ast = []
 
-    def insert_included_files(open_file: TextIO, is_check_include_loop: bool = True, loop_check_depth: int = 20) -> TextIO:
-        
-        # create nested function to check if list of rows cointains include instructions
-        def check_for_includes(input_make: str, regular_expression: Pattern[str]) -> bool:
-            # create list of rows from input make
-            list_of_rows = input_make.split('\n')
-            # find rows which consist include instruction and replace multiple spaces with one
-            matches = [re.sub(' +', ' ', string) for string in list_of_rows if re.match(regular_expression, string)]
+    make_full_text = fd.read()
+    if any(INCLUDE_DIRECTIVE.match(line) for line in make_full_text.splitlines()):
+        source_path = getattr(fd, 'name', None)
+        if not isinstance(source_path, str):
+            raise ValueError('A Makefile with include directives must be read from a named file.')
+        return parse_makefile(source_path, make_args)
 
-            if len(matches) != 0:
-                return True
-            else:
-                return False
-
-        # create nested function to be able insert included makes recursively
-        def replace_include_with_file(
-            input_make: str, regular_expression: Pattern[str]
-        ) -> str:
-            output_make = input_make
-            # create list of rows from input make
-            list_of_rows = input_make.split('\n')
-            # iterate through input makefile
-            for x in range(0,len(list_of_rows)):
-                # check if string contains include instruction
-                if re.match(regular_expression, list_of_rows[x]):
-                    # get names of makefiles from instruction
-                    instruction = re.sub(' +', ' ', list_of_rows[x].split('include ')[1])
-                    # split list of included makes to support multiple entrance
-                    makes = instruction.split(' ')
-        
-                    # initialize empty list to store included instructions as string
-                    included_instructions = []   
-                    # iterate through files from instruction add write them to list
-                    for make in makes:
-                        with open(make, 'r') as fp:
-                            included_instructions.append(fp.read())
-        
-                    # transform list into single string
-                    included_string = '\n'.join(included_instructions)
-        
-                    # replace include with included instruction
-                    output_make = input_make.replace(
-                        list_of_rows[x], included_string, 1
-                    )
-
-            return output_make
-
-        make_full_text = open_file.read()
-
-        # compile regex to find include instructions
-        regex = re.compile(' *s?-?include +')
-        
-        loop_detector = 0
-        
-        # recursively check makefile to check include instruction in included files
-        while check_for_includes(make_full_text, regex):
-            make_full_text = replace_include_with_file(make_full_text, regex)
-            loop_detector += 1
-            if loop_detector > loop_check_depth and is_check_include_loop:
-                raise Exception('Your make chain is looped or too deep (default depth = 20). if you have nesting depth > 20 please set your value with --include_depth option or turn off loop checking with --disable_loop_detection')
-
-        # create temporary file
-        tmp = tempfile.NamedTemporaryFile(mode = 'w+t')
-        tmp_name=tmp.name
-        tmp.close() #on windows it is not possible to open file for writing twice. So file needs to be closed.
-
-        # open temporary file and write composed make to them
-        with open(tmp_name, 'w') as temp_input_file:
-            temp_input_file.write(make_full_text)
-
-        # open temporary file as <class '_io.TextIOWrapper'> to support type compatibiluty with tokenizer() 
-        temp_make_file = open(tmp_name, 'r')
-        
-        return temp_make_file
-
-
-    it = peekable(tokenizer(insert_included_files(fd, is_check_loop, loop_check_depth)))
+    it = peekable(tokenizer(io.StringIO(make_full_text)))
 
     def parse_target(token: Tuple[Tokens, str]):
         """Parse a Makefile rule and store it in the AST.
@@ -250,4 +396,3 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
         )
 
     return dependencies, influences, order_only, indirect_influences
-    

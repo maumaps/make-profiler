@@ -26,6 +26,9 @@ Helps managing a large data processing pipeline written in Makefile.
 
 - Web-based dashboard to view the target statuses and monitor progress.
 
+- Includes (also via `$(MAKEFILE_LIST)`), `-C`, `-f`, `-I`, `-j` and other GNU Make options work as in plain `make`,
+  see [docs/profiling-and-includes.md](docs/profiling-and-includes.md).
+
 ## Example usage
 
     sudo apt install python3-pip graphviz gawk

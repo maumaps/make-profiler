@@ -43,7 +43,7 @@ setup(
     entry_points={
         'console_scripts': [
             'profile_make_clean = make_profiler.cmd_clean:main',
-            'profile_make = make_profiler.__main__:main',
+            'profile_make = make_profiler.__main__:cli',
             'profile_make_lint = make_profiler.lint_makefile:main',
             'profile_make_init_viewer = make_profiler.viewer_export:main'
         ]

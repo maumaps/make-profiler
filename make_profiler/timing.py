@@ -2,7 +2,14 @@ import os
 import time
 
 
-def parse_timing_db(filename, after_date=None):
+def parse_timing_db(filename, after_date=None, directory=None):
+    """Summarize the timing database.
+
+    ``directory`` is the directory GNU Make ran in (``-C``); target files and
+    ``logs/`` are looked up there instead of the profiler's own working
+    directory. Reported ``log`` paths stay relative to it.
+    """
+    directory = directory or os.getcwd()
     if not os.path.isfile(filename):
         return {}
 
@@ -25,15 +32,16 @@ def parse_timing_db(filename, after_date=None):
             targets[target] = {
                 'current': False,
                 'running': False,
-                'done': os.path.exists(target),
-                'isdir': os.path.isdir(target)
+                'done': os.path.exists(os.path.join(directory, target)),
+                'isdir': os.path.isdir(os.path.join(directory, target))
             }
 
         logpath = 'logs/%s/%s/log.txt' % (bid, target)
-        if 'log' not in targets[target] and os.path.exists(logpath):
+        if 'log' not in targets[target] and os.path.exists(os.path.join(directory, logpath)):
             targets[target]['log'] = logpath
 
         failpath = 'logs/%s/%s/failed.touch' % (bid, target)
+        failpath = os.path.join(directory, failpath)
         if 'failed' not in targets[target]:
             targets[target]['failed'] = os.path.exists(failpath)
 
@@ -64,7 +72,7 @@ def parse_timing_db(filename, after_date=None):
     return targets
 
 
-def analyze_target(filename, target_name):
+def analyze_target(filename, target_name, directory=None):
     """Return timing statistics for the given target.
 
     Parameters
@@ -73,6 +81,8 @@ def analyze_target(filename, target_name):
         Path to ``make_profile.db`` file.
     target_name: str
         Name of the target to analyse.
+    directory: str, optional
+        Directory GNU Make ran in; ``logs/`` is looked up there.
 
     Returns
     -------
@@ -81,6 +91,7 @@ def analyze_target(filename, target_name):
         ``max``, ``min``, ``avg``, ``median`` and ``last`` duration in seconds.
     """
 
+    directory = directory or os.getcwd()
     if not os.path.isfile(filename):
         return {
             'started': 0,
@@ -109,7 +120,7 @@ def analyze_target(filename, target_name):
         if 'start' in data:
             started += 1
         if 'start' in data and 'finish' in data:
-            failpath = os.path.join('logs', bid, target_name, 'failed.touch')
+            failpath = os.path.join(directory, 'logs', bid, target_name, 'failed.touch')
             if not os.path.exists(failpath):
                 finished += 1
                 durations.append((data['finish'], data['finish'] - data['start']))
