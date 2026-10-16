@@ -95,7 +95,11 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
     """Read GNU Make's final rule database for a named Makefile.
 
     GNU Make, rather than this parser, evaluates conditionals, variables and
-    includes. ``--question`` keeps the database probe from running targets.
+    includes. ``--question`` keeps the database probe from running ordinary
+    targets, but GNU Make may still remake stale included makefiles before
+    printing the database (see docs/profiling-and-includes.md).  Parsing is
+    therefore not side-effect-free; with goals the traced build already remade
+    them, and ``--preprocess_only`` may remake them as well.
     """
     extra_args = [
         '--no-builtin-rules',
@@ -111,7 +115,10 @@ def parse_makefile(filename: str, make_args=()) -> List[Tuple[Tokens, Dict[str, 
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         universal_newlines=True,
-        env=make_environment(),
+        # Same Makefile-visible locale as the traced build (profile_target uses
+        # keep_recipe_locale=True): an include or conditional using $(LC_ALL)
+        # must see the same environment in both Make processes.
+        env=make_environment(keep_recipe_locale=True),
     )
     if result.returncode not in (0, 1):
         raise subprocess.CalledProcessError(

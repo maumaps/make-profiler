@@ -4,7 +4,13 @@ import subprocess
 import pytest
 
 from make_profiler import __main__ as make_profiler_main
-from make_profiler.make_args import make_environment, makefile_arguments, scan_make_options
+from make_profiler.make_args import (
+    make_environment,
+    make_include_directories,
+    make_working_directory,
+    makefile_arguments,
+    scan_make_options,
+)
 from make_profiler.parser import Tokens, included_makefiles, parse_makefile
 from make_profiler.timing import parse_timing_db
 
@@ -48,6 +54,66 @@ def test_scan_make_options(make_args, goals, dry_run, jobs):
 def test_makefile_arguments_cover_every_gnu_make_spelling(make_args):
     assert makefile_arguments(make_args) == ["Alt.mk"], (
         f"Every spelling of the Makefile option must resolve to Alt.mk; arguments were {make_args!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("make_args", "expected"),
+    (
+        (["-kC", "dir", "all"], "dir"),
+        (["-kCdir", "all"], "dir"),
+        (["-Cdir", "all"], "dir"),
+        (["-C", "dir", "all"], "dir"),
+        (["-C", "a", "--directory=b", "-kC", "c"], "c"),
+    ),
+)
+def test_clustered_directory_options_resolve_working_directory(tmp_path, monkeypatch, make_args, expected):
+    monkeypatch.chdir(tmp_path)
+    base = str(tmp_path)
+    resolved = make_working_directory([a if a not in ("dir", "a", "b", "c") else a for a in make_args])
+    # Resolve relative to tmp_path: compare basenames to avoid cwd coupling.
+    assert resolved.endswith(expected), (
+        f"Clustered -C spellings must resolve like GNU Make; args={make_args!r} got {resolved!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("make_args", "expected"),
+    (
+        (["-kf", "Alt.mk"], ["Alt.mk"]),
+        (["-kfAlt.mk"], ["Alt.mk"]),
+        (["-kI", "inc"], ["inc"]),
+        (["-kIinc"], ["inc"]),
+    ),
+)
+def test_clustered_makefile_and_include_options(make_args, expected, tmp_path):
+    if expected == ["inc"]:
+        got = make_include_directories(make_args, str(tmp_path))
+        assert [p.replace(str(tmp_path) + "/", "") for p in got] == expected, (
+            f"Clustered -I spellings must resolve like scan_make_options; args={make_args!r} got {got!r}"
+        )
+    else:
+        assert makefile_arguments(make_args) == expected, (
+            f"Clustered -f spellings must resolve like scan_make_options; args={make_args!r}"
+        )
+
+
+def test_database_probe_uses_recipe_locale_environment(tmp_path, monkeypatch):
+    (tmp_path / "Makefile").write_text("target:\n\t@true\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LC_ALL", "ru_RU.UTF-8")
+    monkeypatch.setenv("LANGUAGE", "ru")
+    import subprocess as subprocess_module
+    captured = {}
+    real_run = subprocess_module.run
+    def fake_run(*args, **kwargs):
+        captured["env"] = kwargs.get("env", {})
+        return real_run(*args, **kwargs)
+    monkeypatch.setattr(subprocess_module, "run", fake_run)
+    parse_makefile("Makefile")
+    env = captured["env"]
+    assert "LC_ALL" not in env and env.get("LC_MESSAGES") == "C" and "LANGUAGE" not in env, (
+        f"The database probe must see the same Makefile-visible locale as the traced build; got {env!r}"
     )
 
 

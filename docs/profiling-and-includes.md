@@ -36,6 +36,13 @@ searched in the `-C` directory and then in `-I` directories.
 - With `-j` several targets run at once, so no finish can be inferred from the next start.
   All targets are closed when Make exits and a warning says timings are approximate (upper bounds).
 - Dry runs (`-n`, `-q`, `-t`) execute nothing and write no records or logs.
-- Make's messages are parsed in the `C` locale: the profiler sets `LC_ALL=C` for the database probe
-  and `LC_MESSAGES=C` for profiled builds, so recipes keep your locale.
+- Make's messages are parsed in the `C` locale: both the database probe and profiled builds set
+  `LC_MESSAGES=C` (and clear `LANGUAGE`/`LC_ALL` so recipes keep your locale), so an include or
+  conditional using `$(LC_ALL)` sees the same environment in both passes.
+- The rule database is read with `make --print-data-base --question`.
+  `--question` keeps ordinary targets from running, but GNU Make still remakes stale included
+  makefiles first, so parsing is not side-effect-free.
+  With goals the traced build already remade them; `--preprocess_only` may remake them as well.
+  Collecting the database from the same Make process that produces the trace would remove the
+  second remake, but is not implemented yet.
 - `--disable_loop_detection` and `--include_depth` are accepted for compatibility and ignored.

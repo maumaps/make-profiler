@@ -133,37 +133,133 @@ def make_goals(make_args) -> List[str]:
     return scan_make_options(make_args)['goals']
 
 
+def _consume_short_cluster(cluster, position, args, index):
+    """Return (value, consumes_next) for a value-taking letter in a cluster.
+
+    ``cluster`` is the text after ``-``, ``position`` is the letter's index,
+    ``args`` is the full argument list and ``index`` points at the current
+    argument.  A letter with attached text takes it; otherwise it takes the
+    next argument when one exists.
+    """
+    rest = cluster[position + 1:]
+    if rest:
+        return rest, False
+    if index + 1 < len(args):
+        return args[index + 1], True
+    return None, False
+
+
 def make_working_directory(make_args) -> str:
-    """Return GNU Make's effective working directory after its ``-C`` options."""
+    """Return GNU Make's effective working directory after its ``-C`` options.
+
+    Clustered short options (``-kC dir``, ``-kCdir``) are classified the same
+    way as in :func:`scan_make_options`.
+    """
     directory = os.getcwd()
-    arguments = iter(make_args)
-    for argument in arguments:
+    args = list(make_args)
+    index = 0
+    while index < len(args):
+        argument = args[index]
         if argument == '--':
             break
-        if argument in ('-C', '--directory'):
-            directory = os.path.abspath(os.path.join(directory, next(arguments)))
-        elif argument.startswith('-C') and len(argument) > 2:
-            directory = os.path.abspath(os.path.join(directory, argument[2:]))
-        elif argument.startswith('--directory='):
-            directory = os.path.abspath(os.path.join(directory, argument.split('=', 1)[1]))
+        if argument.startswith('--'):
+            name, has_value, value = argument.partition('=')
+            if name == '--directory':
+                if has_value:
+                    directory = os.path.abspath(os.path.join(directory, value))
+                    index += 1
+                elif index + 1 < len(args):
+                    directory = os.path.abspath(os.path.join(directory, args[index + 1]))
+                    index += 2
+                else:
+                    index += 1
+            elif name in LONG_VALUE_OPTIONS and not has_value:
+                index += 2 if index + 1 < len(args) else 1
+            elif name in LONG_OPTIONAL_NUMBER_OPTIONS and not has_value:
+                if index + 1 < len(args) and _is_number(args[index + 1]):
+                    index += 2
+                else:
+                    index += 1
+            else:
+                index += 1
+            continue
+        if argument.startswith('-') and len(argument) > 1:
+            cluster = argument[1:]
+            consumed_next = False
+            for position, character in enumerate(cluster):
+                if character in SHORT_VALUE_OPTIONS:
+                    if character == 'C':
+                        value, consumes_next = _consume_short_cluster(cluster, position, args, index)
+                        if value is not None:
+                            directory = os.path.abspath(os.path.join(directory, value))
+                        consumed_next = consumes_next
+                    elif not cluster[position + 1:] and index + 1 < len(args):
+                        consumed_next = True
+                    break
+                if character in SHORT_OPTIONAL_NUMBER_OPTIONS:
+                    if not cluster[position + 1:] and index + 1 < len(args) and _is_number(args[index + 1]):
+                        consumed_next = True
+                    break
+            index += 2 if consumed_next else 1
+            continue
+        index += 1
     return directory
 
 
 def makefile_arguments(make_args) -> List[str]:
-    """Return the Makefiles selected with ``-f``, ``--file`` or ``--makefile``."""
+    """Return the Makefiles selected with ``-f``, ``--file`` or ``--makefile``.
+
+    Clustered short options (``-kf Alt.mk``, ``-kfAlt.mk``) are classified the
+    same way as in :func:`scan_make_options`.
+    """
     files = []
-    arguments = iter(make_args)
-    for argument in arguments:
+    args = list(make_args)
+    index = 0
+    while index < len(args):
+        argument = args[index]
         if argument == '--':
             break
-        if argument in ('-f', '--file', '--makefile'):
-            value = next(arguments, None)
-            if value is not None:
-                files.append(value)
-        elif argument.startswith(('--file=', '--makefile=')):
-            files.append(argument.split('=', 1)[1])
-        elif argument.startswith('-f') and not argument.startswith('--') and len(argument) > 2:
-            files.append(argument[2:])
+        if argument.startswith('--'):
+            name, has_value, value = argument.partition('=')
+            if name in ('--file', '--makefile'):
+                if has_value:
+                    files.append(value)
+                    index += 1
+                elif index + 1 < len(args):
+                    files.append(args[index + 1])
+                    index += 2
+                else:
+                    index += 1
+            elif name in LONG_VALUE_OPTIONS and not has_value:
+                index += 2 if index + 1 < len(args) else 1
+            elif name in LONG_OPTIONAL_NUMBER_OPTIONS and not has_value:
+                if index + 1 < len(args) and _is_number(args[index + 1]):
+                    index += 2
+                else:
+                    index += 1
+            else:
+                index += 1
+            continue
+        if argument.startswith('-') and len(argument) > 1:
+            cluster = argument[1:]
+            consumed_next = False
+            for position, character in enumerate(cluster):
+                if character in SHORT_VALUE_OPTIONS:
+                    if character == 'f':
+                        value, consumes_next = _consume_short_cluster(cluster, position, args, index)
+                        if value is not None:
+                            files.append(value)
+                        consumed_next = consumes_next
+                    elif not cluster[position + 1:] and index + 1 < len(args):
+                        consumed_next = True
+                    break
+                if character in SHORT_OPTIONAL_NUMBER_OPTIONS:
+                    if not cluster[position + 1:] and index + 1 < len(args) and _is_number(args[index + 1]):
+                        consumed_next = True
+                    break
+            index += 2 if consumed_next else 1
+            continue
+        index += 1
     return files
 
 
@@ -173,21 +269,65 @@ def has_makefile_argument(make_args) -> bool:
 
 
 def make_include_directories(make_args, working_directory) -> List[str]:
-    """Return GNU Make's include search directories in command-line order."""
+    """Return GNU Make's include search directories in command-line order.
+
+    Clustered short options (``-kI dir``, ``-kIdir``) are classified the same
+    way as in :func:`scan_make_options`.
+    """
     directories = []
-    arguments = iter(make_args)
-    for argument in arguments:
+    args = list(make_args)
+    index = 0
+    while index < len(args):
+        argument = args[index]
         if argument == '--':
             break
-        if argument in ('-I', '--include-dir'):
-            directory = next(arguments)
-        elif argument.startswith('-I') and len(argument) > 2:
-            directory = argument[2:]
-        elif argument.startswith('--include-dir='):
-            directory = argument.split('=', 1)[1]
-        else:
+        if argument.startswith('--'):
+            name, has_value, value = argument.partition('=')
+            if name == '--include-dir':
+                if has_value:
+                    directory = value
+                    index += 1
+                elif index + 1 < len(args):
+                    directory = args[index + 1]
+                    index += 2
+                else:
+                    index += 1
+                    continue
+                directories.append(
+                    directory if os.path.isabs(directory) else os.path.join(working_directory, directory)
+                )
+            elif name in LONG_VALUE_OPTIONS and not has_value:
+                index += 2 if index + 1 < len(args) else 1
+            elif name in LONG_OPTIONAL_NUMBER_OPTIONS and not has_value:
+                if index + 1 < len(args) and _is_number(args[index + 1]):
+                    index += 2
+                else:
+                    index += 1
+            else:
+                index += 1
             continue
-        directories.append(
-            directory if os.path.isabs(directory) else os.path.join(working_directory, directory)
-        )
+        if argument.startswith('-') and len(argument) > 1:
+            cluster = argument[1:]
+            consumed_next = False
+            picked = None
+            for position, character in enumerate(cluster):
+                if character in SHORT_VALUE_OPTIONS:
+                    if character == 'I':
+                        value, consumes_next = _consume_short_cluster(cluster, position, args, index)
+                        picked = value
+                        consumed_next = consumes_next
+                    elif not cluster[position + 1:] and index + 1 < len(args):
+                        consumed_next = True
+                    break
+                if character in SHORT_OPTIONAL_NUMBER_OPTIONS:
+                    if not cluster[position + 1:] and index + 1 < len(args) and _is_number(args[index + 1]):
+                        consumed_next = True
+                    break
+            if picked is not None:
+                directories.append(
+                    picked if os.path.isabs(picked) else os.path.join(working_directory, picked)
+                )
+            index += 2 if consumed_next else 1
+            continue
+        index += 1
     return directories
