@@ -197,9 +197,15 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
     Repeated explicit single-colon rules merge and deduplicate their
     prerequisites in first-seen order.  A prerequisite seen normally is
     normal everywhere, even if another rule lists it as order-only.  Pattern
-    rules remain alternatives, so their latest definition overwrites the
-    stored prerequisite lists rather than merging them.  Both graph directions
-    describe that same stored alternative.
+    rules are alternatives that GNU Make selects through implicit-rule search
+    using the actual build state, which this static graph does not know.  The
+    graph therefore stores the union of every alternative in first-seen order
+    rather than keeping only the last definition, so an applicable earlier
+    rule (for example ``%.out: %.first`` when both ``%.first`` and ``%.second``
+    inputs exist) is never omitted from the exported graph and critical-path
+    traversal.  Both graph directions describe that same stored union; consumers
+    must treat co-stored pattern prerequisites as disjunctive alternatives,
+    not as conjunctive requirements.
 
     Returns ``(dependencies, influences, order_only, indirect_influences)``.
     ``order_only`` contains only prerequisites that were never normal;
@@ -222,9 +228,9 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
     def alias(name: str) -> str:
         return alias_map.get(name, name)
 
-    # A declared target remains a graph node even when a later pattern-rule
-    # alternative drops its last incoming edge.  ``descendants`` below walks
-    # every node, so deleting such a node can mutate ``influences`` mid-walk.
+    # A declared target remains a graph node even when it has no outgoing
+    # influence edges.  ``descendants`` below walks every node, so deleting
+    # such a node can mutate ``influences`` mid-walk.
     declared_targets = {
         alias(item['target'])
         for item_t, item in ast
@@ -242,30 +248,14 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
         if target in ('.PHONY',):
             continue
 
-        # Pattern rules are alternatives, not repeated explicit rules.  Keep
-        # the base overwrite representation instead of applying explicit-rule
-        # prerequisite accumulation to them.  Remove reverse edges from the
-        # superseded alternative so critical-path traversal never reaches a
-        # dependency absent from the forward graph.
-        is_pattern_rule = any('%' in name for name in item.get('all_targets', []))
-        if is_pattern_rule:
-            previous_deps, _previous_order_deps = dependencies.get(target, [[], []])
-            for dep in set(previous_deps) - set(deps):
-                influences[dep].discard(target)
-
-            normal_dep_names = set(deps)
-            order_deps = [dep for dep in order_deps if dep not in normal_dep_names]
-            dependencies[target] = [deps, order_deps]
-            influences[target]
-            for dep in deps:
-                influences[dep].add(target)
-            for dep in order_deps:
-                influences[dep]
-            continue
-
-        # GNU Make combines prerequisites from repeated single-colon rules.
-        # Keep the reverse graph aligned with the forward influences below so
-        # critical-path traversal can return through every incoming edge.
+        # Pattern rules are alternatives that GNU Make selects through
+        # implicit-rule search.  Without build-state applicability info the
+        # graph keeps the union of all alternatives (same merge as repeated
+        # explicit rules) so critical-path traversal never misses an applicable
+        # earlier rule.  GNU Make combines prerequisites from repeated
+        # single-colon rules.  Keep the reverse graph aligned with the forward
+        # influences below so critical-path traversal can return through every
+        # incoming edge.
         existing_deps, existing_order_deps = dependencies.setdefault(target, [[], []])
         if target not in dependency_membership:
             dependency_membership[target] = (set(existing_deps), set(existing_order_deps))
@@ -299,8 +289,7 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
             dep for dep in existing_order_deps if dep in known_order_deps
         ]
 
-    # Classify prerequisites from the completed forward graph so a superseded
-    # pattern alternative cannot keep a stale normal or order-only node.
+    # Classify prerequisites from the completed forward graph.
     normal_dependencies = {
         dependency
         for normal_deps, _order_deps in dependencies.values()
@@ -313,11 +302,9 @@ def get_dependencies_influences(ast: List[Tuple[Tokens, Dict[str, Any]]]):
     }
     order_only.difference_update(normal_dependencies)
 
-    # Pattern replacements leave empty reverse nodes behind until the complete
-    # forward graph is known.  Clean them once here instead of repeatedly
-    # rescanning all dependencies for every replacement.  Declared targets and
-    # live normal/order-only prerequisites must remain graph nodes even if they
-    # have no outgoing influence edges.
+    # Clean empty reverse nodes once the complete forward graph is known.
+    # Declared targets and live normal/order-only prerequisites must remain
+    # graph nodes even if they have no outgoing influence edges.
     live_nodes = declared_targets | normal_dependencies | order_only
     for node in list(influences):
         if not influences[node] and node not in live_nodes:
